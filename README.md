@@ -4,9 +4,8 @@ A reinforcement learning environment for training AI agents to navigate hospital
 
 ## 🏥 Environment Overview
 
-<img width="1249" height="911" alt="Image" src="https://github.com/user-attachments/assets/99ef94df-9cbc-4aab-9055-479c689d26d2" />
+<img width="1007" height="709" alt="Image" src="https://github.com/user-attachments/assets/ace66f6d-4c09-4aea-8c96-b93ff8dabe5e" />
 
-[Image](https://github.com/user-attachments/assets/99ef94df-9cbc-4aab-9055-479c689d26d2")
 
 This environment simulates a realistic hospital layout where an AI agent must:
 
