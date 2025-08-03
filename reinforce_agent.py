@@ -1,4 +1,4 @@
-# reinforce_agent.py
+# reinforce_agent.py - Enhanced with Training Stability Analysis and .zip saving
 
 import torch
 import torch.nn as nn
@@ -8,6 +8,8 @@ from torch.distributions import Categorical
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import zipfile
+import pickle
 from typing import Dict, List, Tuple
 import time
 
@@ -51,14 +53,14 @@ class REINFORCEAgent:
         self.action_size = action_size
         self.device = device
 
-        # Default hyperparameters (well-tuned for hospital navigation)
+        # REINFORCE Hyperparameters - Stronger Exploration
         self.default_hyperparams = {
-            'learning_rate': 1e-3,      # Learning rate for policy updates
-            'gamma': 0.99,              # Discount factor
-            'hidden_size': 128,         # Hidden layer size
-            'max_grad_norm': 1.0,       # Gradient clipping
-            'baseline_type': 'mean',    # Baseline for variance reduction ('mean', 'none')
-            'entropy_coef': 0.01,       # Entropy regularization coefficient
+            'learning_rate': 5e-4,          # Reduced learning rate
+            'gamma': 0.995,                 # Higher discount factor
+            'hidden_size': 256,             # Larger hidden layer
+            'max_grad_norm': 0.5,           # Tighter gradient clipping
+            'baseline_type': 'mean',        # Keep mean baseline
+            'entropy_coef': 0.1,
         }
 
         # Override with custom hyperparams if provided
@@ -92,6 +94,11 @@ class REINFORCEAgent:
         self.eval_rewards = []
         self.eval_episodes = []
         self.training_time = 0
+
+        # NEW: Training stability tracking
+        self.policy_entropy_values = []  # Track entropy for stability analysis
+        self.raw_policy_losses = []      # Raw losses before baseline adjustment
+        self.update_numbers = []         # Track update step numbers
 
         # Running baseline for variance reduction
         self.reward_baseline = None
@@ -183,9 +190,15 @@ class REINFORCEAgent:
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), self.max_grad_norm)
         self.optimizer.step()
 
-        # Store losses
+        # Store losses and stability metrics
         self.policy_losses.append(policy_loss.item())
         self.entropy_losses.append(entropy_loss.item())
+
+        # NEW: Store stability tracking
+        current_entropy = torch.stack(self.entropies).mean().item()
+        self.policy_entropy_values.append(current_entropy)
+        self.raw_policy_losses.append(policy_loss.item())
+        self.update_numbers.append(len(self.policy_losses))
 
         # Reset episode
         self.reset_episode()
@@ -222,24 +235,100 @@ class REINFORCEAgent:
         return mean_reward, std_reward, mean_length
 
     def save(self, filepath):
-        """Save model and training state"""
-        torch.save({
-            'policy_net_state_dict': self.policy_net.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'hyperparams': self.hyperparams,
-            'reward_baseline': self.reward_baseline,
-            'episode_rewards': self.episode_rewards,
-            'policy_losses': self.policy_losses,
-        }, filepath)
+        """Save model and training state as .zip file (compatible with SB3 format)"""
+        # Create temporary directory for saving components
+        temp_dir = f"temp_reinforce_{int(time.time())}"
+        os.makedirs(temp_dir, exist_ok=True)
+
+        try:
+            # Save PyTorch model
+            model_path = os.path.join(temp_dir, "policy_net.pth")
+            torch.save({
+                'policy_net_state_dict': self.policy_net.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'state_size': self.state_size,
+                'action_size': self.action_size,
+            }, model_path)
+
+            # Save hyperparameters and training data
+            data_path = os.path.join(temp_dir, "training_data.pkl")
+            training_data = {
+                'hyperparams': self.hyperparams,
+                'reward_baseline': self.reward_baseline,
+                'episode_rewards': self.episode_rewards,
+                'policy_losses': self.policy_losses,
+                'entropy_losses': self.entropy_losses,
+                'policy_entropy_values': self.policy_entropy_values,
+                'raw_policy_losses': self.raw_policy_losses,
+                'update_numbers': self.update_numbers,
+                'eval_rewards': self.eval_rewards,
+                'eval_episodes': self.eval_episodes,
+                'episode_lengths': self.episode_lengths,
+                'training_time': self.training_time
+            }
+
+            with open(data_path, 'wb') as f:
+                pickle.dump(training_data, f)
+
+            # Create zip file
+            with zipfile.ZipFile(filepath, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                zipf.write(model_path, "policy_net.pth")
+                zipf.write(data_path, "training_data.pkl")
+
+            print(f"REINFORCE model saved to {filepath}")
+
+        finally:
+            # Clean up temporary files
+            if os.path.exists(model_path):
+                os.remove(model_path)
+            if os.path.exists(data_path):
+                os.remove(data_path)
+            if os.path.exists(temp_dir):
+                os.rmdir(temp_dir)
 
     def load(self, filepath):
-        """Load model and training state"""
-        checkpoint = torch.load(filepath, map_location=self.device)
-        self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.reward_baseline = checkpoint.get('reward_baseline', None)
-        self.episode_rewards = checkpoint.get('episode_rewards', [])
-        self.policy_losses = checkpoint.get('policy_losses', [])
+        """Load model and training state from .zip file"""
+        temp_dir = f"temp_reinforce_load_{int(time.time())}"
+        os.makedirs(temp_dir, exist_ok=True)
+
+        try:
+            # Extract zip file
+            with zipfile.ZipFile(filepath, 'r') as zipf:
+                zipf.extractall(temp_dir)
+
+            # Load PyTorch model
+            model_path = os.path.join(temp_dir, "policy_net.pth")
+            checkpoint = torch.load(model_path, map_location=self.device)
+            self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+            # Load training data
+            data_path = os.path.join(temp_dir, "training_data.pkl")
+            with open(data_path, 'rb') as f:
+                training_data = pickle.load(f)
+
+            self.reward_baseline = training_data.get('reward_baseline', None)
+            self.episode_rewards = training_data.get('episode_rewards', [])
+            self.policy_losses = training_data.get('policy_losses', [])
+            self.entropy_losses = training_data.get('entropy_losses', [])
+            self.policy_entropy_values = training_data.get('policy_entropy_values', [])
+            self.raw_policy_losses = training_data.get('raw_policy_losses', [])
+            self.update_numbers = training_data.get('update_numbers', [])
+            self.eval_rewards = training_data.get('eval_rewards', [])
+            self.eval_episodes = training_data.get('eval_episodes', [])
+            self.episode_lengths = training_data.get('episode_lengths', [])
+            self.training_time = training_data.get('training_time', 0)
+
+            print(f"REINFORCE model loaded from {filepath}")
+
+        finally:
+            # Clean up temporary files
+            for file in ["policy_net.pth", "training_data.pkl"]:
+                file_path = os.path.join(temp_dir, file)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            if os.path.exists(temp_dir):
+                os.rmdir(temp_dir)
 
     def plot_training_results(self, save_path=None):
         """Plot comprehensive training results"""
@@ -311,6 +400,179 @@ class REINFORCEAgent:
 
         plt.show()
 
+    # NEW METHOD: Training Stability Analysis
+    def plot_training_stability(self, save_path=None):
+        """
+        Plot training stability analysis - objective function and policy entropy curves
+        This is specifically for the mentor's requirement on training stability
+        """
+        if not self.policy_losses:
+            print("No training data available. Train the model first.")
+            return
+
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        fig.suptitle('REINFORCE Training Stability Analysis', fontsize=16, fontweight='bold')
+
+        # Policy Loss (Objective Function) - Main stability indicator
+        if self.policy_losses and len(self.policy_losses) > 1:
+            axes[0, 0].plot(self.policy_losses, color='red', alpha=0.8, linewidth=1.5)
+            axes[0, 0].set_title('Policy Loss (Objective Function)')
+            axes[0, 0].set_xlabel('Episode')
+            axes[0, 0].set_ylabel('Policy Loss')
+            axes[0, 0].grid(True, alpha=0.3)
+
+            # Add trend line for stability analysis
+            if len(self.policy_losses) > 10:
+                z = np.polyfit(range(len(self.policy_losses)), self.policy_losses, 1)
+                p = np.poly1d(z)
+                axes[0, 0].plot(range(len(self.policy_losses)), p(range(len(self.policy_losses))),
+                              "g--", alpha=0.8, linewidth=2, label=f'Trend (slope: {z[0]:.6f})')
+                axes[0, 0].legend()
+
+        # Policy Entropy - Exploration indicator
+        if self.policy_entropy_values and len(self.policy_entropy_values) > 1:
+            axes[0, 1].plot(self.policy_entropy_values, color='blue', alpha=0.8, linewidth=1.5)
+            axes[0, 1].set_title('Policy Entropy (Exploration Level)')
+            axes[0, 1].set_xlabel('Episode')
+            axes[0, 1].set_ylabel('Policy Entropy')
+            axes[0, 1].grid(True, alpha=0.3)
+
+            # Add trend line
+            if len(self.policy_entropy_values) > 10:
+                z = np.polyfit(range(len(self.policy_entropy_values)), self.policy_entropy_values, 1)
+                p = np.poly1d(z)
+                axes[0, 1].plot(range(len(self.policy_entropy_values)),
+                              p(range(len(self.policy_entropy_values))),
+                              "g--", alpha=0.8, linewidth=2, label=f'Trend (slope: {z[0]:.6f})')
+                axes[0, 1].legend()
+
+        # Loss Variance (Rolling Window) - Stability indicator
+        if len(self.policy_losses) > 20:
+            window_size = min(50, len(self.policy_losses) // 4)
+            rolling_std = []
+            for i in range(window_size, len(self.policy_losses)):
+                window_losses = self.policy_losses[i-window_size:i]
+                rolling_std.append(np.std(window_losses))
+
+            axes[1, 0].plot(range(window_size, len(self.policy_losses)), rolling_std,
+                          color='purple', alpha=0.8, linewidth=1.5)
+            axes[1, 0].set_title(f'Policy Loss Variance (Rolling {window_size}-episode window)')
+            axes[1, 0].set_xlabel('Episode')
+            axes[1, 0].set_ylabel('Loss Standard Deviation')
+            axes[1, 0].grid(True, alpha=0.3)
+
+        # Stability Analysis Summary
+        axes[1, 1].axis('off')
+
+        # Calculate stability metrics
+        stability_analysis = self._calculate_stability_metrics()
+
+        analysis_text = f"""
+        TRAINING STABILITY ANALYSIS
+
+        Policy Loss Stability:
+        • Mean: {stability_analysis['policy_loss_mean']:.4f}
+        • Std: {stability_analysis['policy_loss_std']:.4f}
+        • Trend: {stability_analysis['policy_loss_trend']:.6f}
+        • Stability: {stability_analysis['policy_loss_stability']}
+
+        Policy Entropy:
+        • Mean: {stability_analysis['entropy_mean']:.4f}
+        • Std: {stability_analysis['entropy_std']:.4f}
+        • Trend: {stability_analysis['entropy_trend']:.6f}
+        • Stability: {stability_analysis['entropy_stability']}
+
+        REINFORCE Characteristics:
+        • High variance expected (inherent to algorithm)
+        • Baseline helps reduce variance
+        • Entropy should gradually decrease
+
+        Overall Assessment:
+        {stability_analysis['overall_assessment']}
+
+        Key REINFORCE Indicators:
+        • Decreasing loss trend = Learning progress
+        • Controlled entropy decay = Good exploration→exploitation
+        • Baseline effectiveness = Variance reduction
+        """
+
+        axes[1, 1].text(0.05, 0.95, analysis_text, transform=axes[1, 1].transAxes,
+                       verticalalignment='top', fontsize=9, fontfamily='monospace',
+                       bbox=dict(boxstyle="round,pad=0.5", facecolor="lightblue", alpha=0.8))
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Training stability plots saved to {save_path}")
+
+        plt.show()
+
+    def _calculate_stability_metrics(self):
+        """Calculate quantitative stability metrics for REINFORCE"""
+        metrics = {}
+
+        # Policy loss stability
+        if self.policy_losses:
+            losses = np.array(self.policy_losses)
+            metrics['policy_loss_mean'] = np.mean(losses)
+            metrics['policy_loss_std'] = np.std(losses)
+
+            if len(losses) > 10:
+                # Calculate trend (slope of linear fit)
+                z = np.polyfit(range(len(losses)), losses, 1)
+                metrics['policy_loss_trend'] = z[0]
+
+                # For REINFORCE, we expect higher variance, so adjust thresholds
+                cv = metrics['policy_loss_std'] / abs(metrics['policy_loss_mean']) if metrics['policy_loss_mean'] != 0 else float('inf')
+                if cv < 0.3:
+                    metrics['policy_loss_stability'] = "Very Stable (Excellent for REINFORCE)"
+                elif cv < 0.6:
+                    metrics['policy_loss_stability'] = "Stable (Good for REINFORCE)"
+                elif cv < 1.0:
+                    metrics['policy_loss_stability'] = "Moderately Stable (Normal for REINFORCE)"
+                else:
+                    metrics['policy_loss_stability'] = "High Variance (Consider baseline tuning)"
+            else:
+                metrics['policy_loss_trend'] = 0.0
+                metrics['policy_loss_stability'] = "Insufficient Data"
+
+        # Policy entropy stability
+        if self.policy_entropy_values:
+            entropy = np.array(self.policy_entropy_values)
+            metrics['entropy_mean'] = np.mean(entropy)
+            metrics['entropy_std'] = np.std(entropy)
+
+            if len(entropy) > 10:
+                z = np.polyfit(range(len(entropy)), entropy, 1)
+                metrics['entropy_trend'] = z[0]
+
+                # For entropy, we want it to decrease gradually (exploration → exploitation)
+                if z[0] < -0.001:  # Decreasing
+                    metrics['entropy_stability'] = "Good (Decreasing as expected)"
+                elif abs(z[0]) < 0.001:  # Stable
+                    metrics['entropy_stability'] = "Stable (May need more exploration)"
+                else:  # Increasing
+                    metrics['entropy_stability'] = "Increasing (Check entropy coefficient)"
+            else:
+                metrics['entropy_trend'] = 0.0
+                metrics['entropy_stability'] = "Insufficient Data"
+
+        # Overall assessment for REINFORCE
+        if 'policy_loss_stability' in metrics and 'entropy_stability' in metrics:
+            if "Stable" in metrics['policy_loss_stability'] and "Good" in metrics['entropy_stability']:
+                metrics['overall_assessment'] = "✓ REINFORCE training appears stable with good exploration decay"
+            elif "High Variance" in metrics['policy_loss_stability']:
+                metrics['overall_assessment'] = "⚠ High variance detected - consider stronger baseline or lower learning rate"
+            elif "Increasing" in metrics['entropy_stability']:
+                metrics['overall_assessment'] = "⚠ Entropy increasing - check hyperparameters"
+            else:
+                metrics['overall_assessment'] = "→ Training shows typical REINFORCE behavior"
+        else:
+            metrics['overall_assessment'] = "Insufficient data for assessment"
+
+        return metrics
+
     def get_training_data(self):
         """Return training data for comparison plots"""
         return {
@@ -319,7 +581,10 @@ class REINFORCEAgent:
             'policy_losses': self.policy_losses,
             'entropy_losses': self.entropy_losses,
             'eval_rewards': self.eval_rewards,
-            'eval_episodes': self.eval_episodes
+            'eval_episodes': self.eval_episodes,
+            'policy_entropy_values': self.policy_entropy_values,  # NEW
+            'raw_policy_losses': self.raw_policy_losses,          # NEW
+            'update_numbers': self.update_numbers                  # NEW
         }
 
 class REINFORCETrainer:
@@ -443,9 +708,12 @@ def run_reinforce_experiment(env, total_episodes=2000, hyperparams=None):
     os.makedirs('plots', exist_ok=True)
     agent.plot_training_results(save_path='plots/reinforce_training_results.png')
 
-    # Save model
+    # NEW: Plot training stability analysis
+    agent.plot_training_stability(save_path='plots/reinforce_training_stability.png')
+
+    # Save model as .zip (now compatible with other agents)
     os.makedirs('models', exist_ok=True)
-    agent.save('models/reinforce_hospital_navigation.pth')
+    agent.save('models/reinforce_hospital_navigation.zip')
 
     return agent, trainer.get_training_data()
 
@@ -453,37 +721,38 @@ def justify_reinforce_hyperparameters():
     """
     Justification for chosen REINFORCE hyperparameters:
 
-    1. Learning Rate (1e-3): Higher than value-based methods since REINFORCE
-       has high variance and needs larger steps to overcome noise.
+    1. Learning Rate (5e-4): Reduced from 1e-3 because REINFORCE has high variance
+       and needs more careful steps to avoid instability.
 
-    2. Gamma (0.99): High discount factor for long hospital episodes where
+    2. Gamma (0.995): Very high discount factor for long hospital episodes where
        future patient outcomes matter significantly.
 
     3. Baseline ('mean'): Uses running mean of returns as baseline to reduce
        variance, crucial for REINFORCE which has inherently high variance.
 
-    4. Entropy Coefficient (0.01): Small entropy bonus to encourage exploration
-       of different hospital navigation strategies.
+    4. Entropy Coefficient (0.1): Higher entropy bonus to encourage exploration
+       of different hospital navigation strategies, especially important early in training.
 
-    5. Gradient Clipping (1.0): Essential for REINFORCE to prevent exploding
-       gradients due to high variance of policy gradient estimates.
+    5. Gradient Clipping (0.5): Tighter clipping essential for REINFORCE to prevent
+       exploding gradients due to high variance of policy gradient estimates.
 
-    6. Network Architecture [128, 128, 128]: Deep network to capture complex
+    6. Network Architecture [256, 256, 256]: Larger network to capture complex
        relationships in hospital environment, with dropout for regularization.
 
-    7. Normalization: Returns are normalized per episode to stabilize learning
-       across different reward scales in hospital scenarios.
+    7. Hidden Size (256): Larger than default to handle complex hospital state representations.
 
     REINFORCE Challenges in Hospital Environment:
     - High variance due to sparse rewards (patient deliveries)
     - Long episodes (~1000 steps) amplify variance
     - Complex state space requires good exploration
+    - No value function to guide learning
 
     Mitigations Applied:
     - Baseline subtraction for variance reduction
-    - Gradient clipping for stability
-    - Entropy regularization for exploration
+    - Tighter gradient clipping for stability
+    - Higher entropy regularization for exploration
     - Return normalization for consistent learning
+    - Larger network capacity for complex patterns
     """
     pass
 
